@@ -1,0 +1,21 @@
+ID;PWXL;N;E
+P;PGeneral
+P;P0.00
+P;EArial;M200
+F;P0;DG0G8;M240
+B;Y4;X4;D0 0 3 3
+O;L;D;V0;K47;G100 0.001
+F;W1 1 12
+C;Y1;X1;K"unitID"
+C;X2;K"name"
+C;X3;K"hp"
+C;X4;K"flying"
+C;Y2;X1;K"hfoo"
+C;X2;K"Footman;; the first"
+C;X3;K420;AMax hit points :before upgrades
+C;X4;KFALSE
+C;Y3;X1;K"hkni"
+F;P1;FF2R;X3
+C;K835.5;ER[-1]C*2
+C;X4;K#VALUE!
+E

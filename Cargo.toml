@@ -1,0 +1,17 @@
+[package]
+name = "slk-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A parser, table model, editor and semantic highlighter for SYLK (.slk), the spreadsheet format of Warcraft III's data tables"
+license = "CC0-1.0"
+
+[[bin]]
+name = "slk-rs"
+path = "src/main.rs"
+
+[lib]
+name = "slk_rs"
+path = "src/lib.rs"
+
+[dependencies]
+parser-rs = { path = "../parser-rs" }
