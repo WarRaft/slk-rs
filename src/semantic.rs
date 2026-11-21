@@ -7,30 +7,29 @@
 //! - `TRUE` / `FALSE`: `keyword`; error values (`#VALUE!`): `enumMember`;
 //! - formulas: `function`; cell comments (`C;A`): `comment`.
 
-use crate::lexer::tokenize;
-use crate::token::Tok;
+use crate::lexer::{Piece, ValueKind, scan};
 use parser_rs::semantic;
 use parser_rs::{Modifiers, SemanticToken, SemanticType as T};
 
-/// Every semantic token in `src`, unencoded.
+/// Every semantic token in `src`, unencoded. Read with [`scan`], which
+/// copies nothing: the scanner's pieces, not its tokens.
 pub fn semantic_tokens(src: &str) -> Vec<SemanticToken> {
-    tokenize(src)
-        .iter()
-        .filter_map(|t| {
-            let ty = match &t.kind {
-                Tok::RecordType(_) | Tok::Bool(_) => T::Keyword,
-                Tok::Semi => T::Operator,
-                Tok::FieldName(_) => T::Property,
-                Tok::Number(_) => T::Number,
-                Tok::Str { .. } | Tok::Text(_) => T::String,
-                Tok::ErrorValue(_) => T::EnumMember,
-                Tok::Formula(_) => T::Function,
-                Tok::Comment(_) => T::Comment,
-                _ => return None,
-            };
-            Some(SemanticToken::at(t, ty, Modifiers::NONE))
-        })
-        .collect()
+    let mut out = Vec::new();
+    scan(src, |piece, line, start, end, _| {
+        let ty = match piece {
+            Piece::RecordType | Piece::Value(ValueKind::Bool) => T::Keyword,
+            Piece::Semi => T::Operator,
+            Piece::FieldName => T::Property,
+            Piece::Value(ValueKind::Number) => T::Number,
+            Piece::Value(ValueKind::Str { .. } | ValueKind::Text) => T::String,
+            Piece::Value(ValueKind::Error) => T::EnumMember,
+            Piece::Value(ValueKind::Formula) => T::Function,
+            Piece::Value(ValueKind::Comment) => T::Comment,
+            Piece::AfterEnd | Piece::Newline => return,
+        };
+        out.push(SemanticToken::new(line, start, end, ty, Modifiers::NONE));
+    });
+    out
 }
 
 /// [`semantic_tokens`] in the editor's wire format.

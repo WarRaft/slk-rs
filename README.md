@@ -140,10 +140,17 @@ else, with no parse errors after.
 
 ### Speed
 
-`Units\UnitBalance.slk` (565 KB, 51,000 cells): scanning 43 ms, parsing
-72 ms, the table 16 ms, lint 20 ms, highlighting 95 ms (release build). The
-scanner allocates a string per token; that is the first thing to make
-faster.
+`Units\UnitBalance.slk` (565 KB, 51,000 cells), release build:
+tokens 28 ms, parsing 31 ms, the table 18 ms, lint 16 ms, highlighting
+9 ms (19 ms encoded for the editor). `cargo run --release --example bench
+-- <file.slk>` times each stage.
+
+The scanner (`lexer::scan`) walks the text once and copies nothing: it
+hands out pieces of the line (`&str`), with columns counted only on lines
+that aren't ASCII. The highlighter reads those pieces directly, and so
+does the parser, which copies only the values the document keeps.
+`tokenize` builds owned tokens from the same pieces, for tools that want
+them.
 
 ## Highlighting
 

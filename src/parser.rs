@@ -1,4 +1,4 @@
-//! Reads the scanner's tokens into a [`Document`], line by line. A line
+//! Reads the scanner's pieces into a [`Document`], line by line. A line
 //! with a problem is read as far as it goes and the problem recorded; the
 //! rest of the file still parses. What's checked:
 //!
@@ -14,49 +14,32 @@
 //! skip what they don't know.
 
 use crate::ast::*;
-use crate::lexer::tokenize;
-use crate::token::{Tok, Token};
+use crate::lexer::{Piece, ValueKind, scan};
+use crate::token::Tok;
 
 pub struct Parser;
 
 impl Parser {
+    /// Reads `src` piece by piece from the scanner ([`scan`]): no token
+    /// list in between, and only the values the document keeps are copied.
     pub fn parse_str(src: &str) -> Document {
-        let tokens = tokenize(src);
-        let mut doc = Document {
-            newline: if src.contains("\r\n") { "\r\n" } else { "\n" },
-            ..Document::default()
+        let mut p = Builder {
+            doc: Document {
+                newline: if src.contains("\r\n") { "\r\n" } else { "\n" },
+                ..Document::default()
+            },
+            record: None,
+            field: None,
+            ended: None,
+            last_line: 1,
         };
-        let mut ended = None;
-        let mut last_line = 1;
-        for line in tokens.split(|t| t.kind == Tok::Newline) {
-            let Some(first) = line.first() else { continue };
-            last_line = first.line;
-            match &first.kind {
-                Tok::RecordType(_) => {
-                    let record = record(line, &mut doc.errors);
-                    if doc.records.is_empty() && record.kind != "ID" {
-                        doc.errors.push(error(
-                            "a SYLK file starts with an ID record, like ID;PWXL;N;E",
-                            record.span,
-                        ));
-                    }
-                    if record.kind == "E" {
-                        ended = Some(record.line);
-                    }
-                    doc.records.push(record);
-                }
-                Tok::AfterEnd(_) => {
-                    let line_no = ended.unwrap_or(0);
-                    doc.errors.push(error(
-                        format!("text after the E record (line {line_no}), which ends the file"),
-                        Span::new(first.line, first.col, first.line, first.end_col),
-                    ));
-                }
-                _ => {}
-            }
-        }
-        if ended.is_none() {
-            let line = doc.records.last().map_or(last_line, |r| r.line);
+        scan(src, |piece, line, start, end, text| {
+            p.piece(piece, Span::new(line, start, line, end), text)
+        });
+        p.end_record();
+        let mut doc = p.doc;
+        if p.ended.is_none() {
+            let line = doc.records.last().map_or(p.last_line, |r| r.line);
             doc.errors.push(ParseError::at(
                 "missing the E record that ends the file",
                 line,
@@ -64,6 +47,122 @@ impl Parser {
             ));
         }
         doc
+    }
+}
+
+/// The document so far, and the record and field being read.
+struct Builder {
+    doc: Document,
+    record: Option<Record>,
+    /// The letter of a field whose value may follow, and its span.
+    field: Option<(char, Span)>,
+    /// The line of the `E` record.
+    ended: Option<usize>,
+    last_line: usize,
+}
+
+impl Builder {
+    fn piece(&mut self, piece: Piece, at: Span, text: &str) {
+        match piece {
+            Piece::RecordType => {
+                if text.is_empty() {
+                    self.doc
+                        .errors
+                        .push(error("missing the record type before ';'", at));
+                }
+                self.record = Some(Record {
+                    kind: text.to_string(),
+                    line: at.start_line,
+                    span: at,
+                    fields: Vec::new(),
+                });
+            }
+            Piece::Semi => self.end_field(),
+            Piece::FieldName => {
+                self.end_field();
+                self.field = text.chars().next().map(|c| (c, at));
+            }
+            Piece::Value(kind) => {
+                if let Some((name, name_span)) = self.field.take() {
+                    let unclosed = kind == (ValueKind::Str { closed: false });
+                    let value = value(crate::lexer::value(kind, text));
+                    self.push_field(name, name_span, value, at, unclosed);
+                }
+            }
+            Piece::AfterEnd => {
+                let line = self.ended.unwrap_or(0);
+                self.doc.errors.push(error(
+                    format!("text after the E record (line {line}), which ends the file"),
+                    at,
+                ));
+            }
+            Piece::Newline => {
+                self.last_line = at.start_line;
+                self.end_record();
+            }
+        }
+    }
+
+    /// A field without a value: its letter alone.
+    fn end_field(&mut self) {
+        if let Some((name, name_span)) = self.field.take() {
+            let at = Span::new(
+                name_span.start_line,
+                name_span.end_col,
+                name_span.start_line,
+                name_span.end_col,
+            );
+            self.push_field(name, name_span, Value::Empty, at, false);
+        }
+    }
+
+    fn push_field(
+        &mut self,
+        name: char,
+        name_span: Span,
+        value: Value,
+        value_span: Span,
+        unclosed: bool,
+    ) {
+        let Some(record) = self.record.as_mut() else {
+            return;
+        };
+        let has_value = value != Value::Empty;
+        record.fields.push(Field {
+            name,
+            value,
+            span: Span::new(
+                name_span.start_line,
+                name_span.start_col,
+                name_span.start_line,
+                value_span.end_col,
+            ),
+            value_span,
+        });
+        check(
+            record,
+            record.fields.last().expect("just pushed"),
+            has_value,
+            unclosed,
+            &mut self.doc.errors,
+        );
+    }
+
+    fn end_record(&mut self) {
+        self.end_field();
+        let Some(record) = self.record.take() else {
+            return;
+        };
+        if self.doc.records.is_empty() && record.kind != "ID" {
+            self.doc.errors.push(error(
+                "a SYLK file starts with an ID record, like ID;PWXL;N;E",
+                record.span,
+            ));
+        }
+        if record.kind == "E" {
+            self.ended = Some(record.line);
+        }
+        self.doc.records.push(record);
     }
 }
 
@@ -76,88 +175,27 @@ fn error(message: impl Into<String>, span: Span) -> ParseError {
     }
 }
 
-fn span(t: &Token<Tok>) -> Span {
-    Span::new(t.line, t.col, t.end_line, t.end_col)
-}
-
-/// One line's tokens, from its record type: the record.
-fn record(tokens: &[Token<Tok>], errors: &mut Vec<ParseError>) -> Record {
-    let head = &tokens[0];
-    let Tok::RecordType(kind) = &head.kind else {
-        unreachable!("a line starts with its record type")
-    };
-    let mut record = Record {
-        kind: kind.clone(),
-        line: head.line,
-        span: span(head),
-        fields: Vec::new(),
-    };
-    if kind.is_empty() {
-        errors.push(error("missing the record type before ';'", span(head)));
-    }
-    let mut i = 1;
-    while i < tokens.len() {
-        // `;`, then the letter and its value, if any.
-        let Some(name_tok) = tokens
-            .get(i + 1)
-            .filter(|t| matches!(t.kind, Tok::FieldName(_)))
-        else {
-            i += 1;
-            continue;
-        };
-        let Tok::FieldName(name) = name_tok.kind else {
-            unreachable!()
-        };
-        let value_tok = tokens
-            .get(i + 2)
-            .filter(|t| !matches!(t.kind, Tok::Semi | Tok::FieldName(_) | Tok::Eof));
-        let value_span = value_tok.map_or(
-            Span::new(
-                name_tok.line,
-                name_tok.end_col,
-                name_tok.line,
-                name_tok.end_col,
-            ),
-            span,
-        );
-        let value = value_tok.map_or(Value::Empty, |t| value(&t.kind));
-        record.fields.push(Field {
-            name,
-            value,
-            span: Span::new(
-                name_tok.line,
-                name_tok.col,
-                name_tok.line,
-                value_span.end_col,
-            ),
-            value_span,
-        });
-        check(
-            &record,
-            record.fields.last().expect("just pushed"),
-            value_tok,
-            errors,
-        );
-        i += if value_tok.is_some() { 3 } else { 2 };
-    }
-    record
-}
-
-fn value(tok: &Tok) -> Value {
+fn value(tok: Tok) -> Value {
     match tok {
-        Tok::Number(n) => Value::Number(n.clone()),
-        Tok::Str { value, .. } => Value::Str(value.clone()),
-        Tok::Bool(b) => Value::Bool(*b),
-        Tok::ErrorValue(e) => Value::Error(e.clone()),
-        Tok::Formula(f) => Value::Formula(f.clone()),
-        Tok::Comment(c) => Value::Comment(c.clone()),
-        Tok::Text(t) => Value::Text(t.clone()),
+        Tok::Number(n) => Value::Number(n),
+        Tok::Str { value, .. } => Value::Str(value),
+        Tok::Bool(b) => Value::Bool(b),
+        Tok::ErrorValue(e) => Value::Error(e),
+        Tok::Formula(f) => Value::Formula(f),
+        Tok::Comment(c) => Value::Comment(c),
+        Tok::Text(t) => Value::Text(t),
         _ => Value::Empty,
     }
 }
 
 /// The checks of the module docs, for one field.
-fn check(record: &Record, field: &Field, tok: Option<&Token<Tok>>, errors: &mut Vec<ParseError>) {
+fn check(
+    record: &Record,
+    field: &Field,
+    has_value: bool,
+    unclosed: bool,
+    errors: &mut Vec<ParseError>,
+) {
     let kind = record.kind.as_str();
     let at = field.value_span;
     match (kind, field.name) {
@@ -173,13 +211,13 @@ fn check(record: &Record, field: &Field, tok: Option<&Token<Tok>>, errors: &mut 
                 _ => errors.push(error(format!("expected the {what} number after {}", field.name), field.span)),
             }
         }
-        ("C", 'K') => match tok.map(|t| &t.kind) {
-            Some(Tok::Str { closed: false, .. }) => errors.push(error("string isn't closed: '\"' missing", at)),
-            Some(Tok::Text(t)) => errors.push(error(
+        ("C", 'K') => match &field.value {
+            _ if !has_value => errors.push(error("expected the cell value after K", field.span)),
+            Value::Str(_) if unclosed => errors.push(error("string isn't closed: '\"' missing", at)),
+            Value::Text(t) => errors.push(error(
                 format!("expected a cell value: a number, a \"string\", TRUE, FALSE or an error like #VALUE!, found '{t}'"),
                 at,
             )),
-            None => errors.push(error("expected the cell value after K", field.span)),
             _ => {}
         },
         _ => {}

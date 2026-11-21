@@ -14,118 +14,212 @@
 //! The scanner never fails: a value that doesn't fit its field becomes a
 //! [`Tok::Text`] and the parser reports it.
 
+use std::borrow::Cow;
+
 use crate::token::{Tok, Token};
 
-/// Scans `src` into tokens: each line's tokens, then [`Tok::Newline`]
-/// (none after the last line), then [`Tok::Eof`]. `\r\n` endings and a
-/// leading byte-order mark are accepted. Lines after the `E` record are
-/// one [`Tok::AfterEnd`] each.
-pub fn tokenize(src: &str) -> Vec<Token<Tok>> {
-    let src = src.strip_prefix('\u{FEFF}').unwrap_or(src);
-    let mut out = Vec::new();
-    let (mut line, mut end) = (1, 1);
-    let mut ended = false;
-    for (i, raw) in src.split('\n').enumerate() {
-        if i > 0 {
-            out.push(Token::new(Tok::Newline, line, end, end + 1));
-            line += 1;
-        }
-        let chars: Vec<char> = raw.strip_suffix('\r').unwrap_or(raw).chars().collect();
-        end = chars.len() + 1;
-        if chars.is_empty() {
-            continue;
-        }
-        if ended {
-            out.push(Token::new(
-                Tok::AfterEnd(chars.iter().collect()),
-                line,
-                1,
-                end,
-            ));
-            continue;
-        }
-        ended = scan_line(&chars, line, &mut out);
-    }
-    out.push(Token::new(Tok::Eof, line, end, end));
-    out
+/// What a piece of a line is, without its text: all the highlighter needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Piece {
+    RecordType,
+    Semi,
+    FieldName,
+    Value(ValueKind),
+    /// A line after the `E` record.
+    AfterEnd,
+    Newline,
 }
 
-/// The fields of a line: (start, end) char ranges, end exclusive, the first
-/// being the record type. A `;` ends a field unless another follows it.
-pub(crate) fn split(chars: &[char]) -> Vec<(usize, usize)> {
-    let mut fields = Vec::new();
-    let (mut start, mut i) = (0, 0);
-    while i < chars.len() {
-        if chars[i] == ';' {
-            if chars.get(i + 1) == Some(&';') && i > start {
-                i += 2;
-                continue;
+/// What a field's value is, by its record, its letter and its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    Number,
+    /// `"..."`; `closed` is false without the closing quote.
+    Str {
+        closed: bool,
+    },
+    Bool,
+    Error,
+    Formula,
+    Comment,
+    Text,
+}
+
+/// Walks `src` piece by piece, without copying anything: `f` gets each
+/// piece's kind, line, columns (1-based characters, end exclusive) and
+/// its text as written (a value with its quotes and `;;`). [`tokenize`]
+/// and the highlighter both read it.
+pub fn scan(src: &str, mut f: impl FnMut(Piece, usize, usize, usize, &str)) {
+    let src = src.strip_prefix('\u{FEFF}').unwrap_or(src);
+    let mut ended = false;
+    let mut lines = src.split('\n').peekable();
+    let mut line = 0;
+    while let Some(raw) = lines.next() {
+        line += 1;
+        let text = raw.strip_suffix('\r').unwrap_or(raw);
+        let ascii = text.is_ascii();
+        // The column of byte offset `b`: the byte itself on an ASCII line.
+        let col = |b: usize| {
+            if ascii {
+                b + 1
+            } else {
+                text[..b].chars().count() + 1
             }
-            fields.push((start, i));
-            start = i + 1;
+        };
+        if !text.is_empty() {
+            if ended {
+                f(Piece::AfterEnd, line, 1, col(text.len()), text);
+            } else {
+                ended = scan_line(text, line, &col, &mut f);
+            }
         }
-        i += 1;
+        // The line break, just past the line's last character; the last
+        // line has none.
+        let end = col(text.len());
+        if lines.peek().is_some() {
+            f(Piece::Newline, line, end, end + 1, "");
+        } else {
+            f(Piece::Newline, line, end, end, "");
+        }
     }
-    fields.push((start, chars.len()));
-    fields
+}
+
+/// The fields of a line: (start, end) byte ranges, end exclusive, the
+/// first being the record type. A `;` ends a field unless another follows
+/// it.
+fn split(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let bytes = text.as_bytes();
+    let (mut start, mut i) = (0, 0);
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        while i < bytes.len() {
+            if bytes[i] == b';' {
+                if bytes.get(i + 1) == Some(&b';') && i > start {
+                    i += 2;
+                    continue;
+                }
+                let field = (start, i);
+                i += 1;
+                start = i;
+                return Some(field);
+            }
+            i += 1;
+        }
+        done = true;
+        Some((start, bytes.len()))
+    })
 }
 
 /// Scans one record; whether it is the `E` that ends the file.
-fn scan_line(chars: &[char], line: usize, out: &mut Vec<Token<Tok>>) -> bool {
-    let fields = split(chars);
-    let (ts, te) = fields[0];
-    let record: String = chars[ts..te].iter().collect();
-    out.push(Token::new(
-        Tok::RecordType(record.clone()),
-        line,
-        ts + 1,
-        te + 1,
-    ));
-    for &(s, e) in &fields[1..] {
-        out.push(Token::new(Tok::Semi, line, s, s + 1));
+fn scan_line(
+    text: &str,
+    line: usize,
+    col: &impl Fn(usize) -> usize,
+    f: &mut impl FnMut(Piece, usize, usize, usize, &str),
+) -> bool {
+    let mut fields = split(text);
+    let (ts, te) = fields.next().expect("a line has a record type");
+    let record = &text[ts..te];
+    f(Piece::RecordType, line, col(ts), col(te), record);
+    for (s, e) in fields {
+        // The `;` before the field.
+        f(Piece::Semi, line, col(s - 1), col(s), ";");
         if s == e {
             continue;
         }
-        let letter = chars[s];
-        out.push(Token::new(Tok::FieldName(letter), line, s + 1, s + 2));
-        if e > s + 1 {
-            let raw: String = chars[s + 1..e].iter().collect();
-            out.push(Token::new(value(&record, letter, &raw), line, s + 2, e + 1));
+        let letter_end = s + text[s..].chars().next().map_or(1, char::len_utf8);
+        let letter = &text[s..letter_end];
+        f(Piece::FieldName, line, col(s), col(letter_end), letter);
+        if e > letter_end {
+            let raw = &text[letter_end..e];
+            let kind = value_kind(record, letter, raw);
+            f(Piece::Value(kind), line, col(letter_end), col(e), raw);
         }
     }
     record == "E"
 }
 
 /// What the value `raw` of field `letter` in a `record` record is.
-fn value(record: &str, letter: char, raw: &str) -> Tok {
-    let text = raw.replace(";;", ";");
+fn value_kind(record: &str, letter: &str, raw: &str) -> ValueKind {
     match (record, letter) {
-        ("C", 'K') => literal(&text),
-        ("C" | "NN", 'E') => Tok::Formula(text),
-        ("C", 'A') => Tok::Comment(decode(&text)),
-        ("C" | "F" | "B", 'X' | 'Y') if is_number(&text) => Tok::Number(text),
-        _ => Tok::Text(text),
+        ("C", "K") => literal_kind(raw),
+        ("C" | "NN", "E") => ValueKind::Formula,
+        ("C", "A") => ValueKind::Comment,
+        ("C" | "F" | "B", "X" | "Y") if is_number(raw) => ValueKind::Number,
+        _ => ValueKind::Text,
     }
 }
 
 /// A cell value: `"text"`, a number, `TRUE` / `FALSE`, `#ERROR`.
-fn literal(text: &str) -> Tok {
-    if let Some(rest) = text.strip_prefix('"') {
-        let (value, closed) = match rest.strip_suffix('"') {
-            Some(inner) => (inner, true),
-            None => (rest, false),
-        };
-        return Tok::Str {
-            value: decode(value),
-            closed,
-        };
+fn literal_kind(raw: &str) -> ValueKind {
+    match raw {
+        _ if raw.starts_with('"') => ValueKind::Str {
+            closed: raw.len() >= 2 && raw.ends_with('"'),
+        },
+        "TRUE" | "FALSE" => ValueKind::Bool,
+        _ if raw.starts_with('#') => ValueKind::Error,
+        _ if is_number(raw) => ValueKind::Number,
+        _ => ValueKind::Text,
     }
-    match text {
-        "TRUE" => Tok::Bool(true),
-        "FALSE" => Tok::Bool(false),
-        _ if text.starts_with('#') => Tok::ErrorValue(text.to_string()),
-        _ if is_number(text) => Tok::Number(text.to_string()),
-        _ => Tok::Text(text.to_string()),
+}
+
+/// Scans `src` into tokens: each line's tokens, then [`Tok::Newline`]
+/// (none after the last line), then [`Tok::Eof`]. `\r\n` endings and a
+/// leading byte-order mark are accepted. Lines after the `E` record are
+/// one [`Tok::AfterEnd`] each.
+pub fn tokenize(src: &str) -> Vec<Token<Tok>> {
+    let mut out = Vec::new();
+    let mut last = (1, 1);
+    scan(src, |piece, line, start, end, text| {
+        if piece == Piece::Newline && start == end {
+            // Past the last line: where Eof goes.
+            last = (line, start);
+            return;
+        }
+        let kind = match piece {
+            Piece::RecordType => Tok::RecordType(text.to_string()),
+            Piece::Semi => Tok::Semi,
+            Piece::FieldName => Tok::FieldName(text.chars().next().expect("a letter")),
+            Piece::Value(kind) => value(kind, text),
+            Piece::AfterEnd => Tok::AfterEnd(text.to_string()),
+            Piece::Newline => Tok::Newline,
+        };
+        out.push(Token::new(kind, line, start, end));
+    });
+    out.push(Token::new(Tok::Eof, last.0, last.1, last.1));
+    out
+}
+
+/// A value's token: its text with `;;` read as `;`, and escapes decoded in
+/// strings and comments.
+pub(crate) fn value(kind: ValueKind, raw: &str) -> Tok {
+    let text = unescape(raw);
+    match kind {
+        ValueKind::Str { closed } => {
+            let inner = &text[1..text.len() - usize::from(closed)];
+            Tok::Str {
+                value: decode(inner),
+                closed,
+            }
+        }
+        ValueKind::Number => Tok::Number(text.into_owned()),
+        ValueKind::Bool => Tok::Bool(text == "TRUE"),
+        ValueKind::Error => Tok::ErrorValue(text.into_owned()),
+        ValueKind::Formula => Tok::Formula(text.into_owned()),
+        ValueKind::Comment => Tok::Comment(decode(&text)),
+        ValueKind::Text => Tok::Text(text.into_owned()),
+    }
+}
+
+/// `;;` as `;`, copying only when there is one.
+fn unescape(raw: &str) -> Cow<'_, str> {
+    if raw.contains(";;") {
+        Cow::Owned(raw.replace(";;", ";"))
+    } else {
+        Cow::Borrowed(raw)
     }
 }
 
@@ -151,6 +245,9 @@ pub fn is_number(text: &str) -> bool {
 /// (`- 0x20`), low bits from the second (`- 0x30`): `ESC :` is `\n`. Other
 /// `ESC` sequences are kept as written.
 pub fn decode(text: &str) -> String {
+    if !text.contains('\x1B') {
+        return text.to_string();
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
     let mut i = 0;
