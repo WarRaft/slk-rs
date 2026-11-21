@@ -227,39 +227,7 @@ fn grow_bounds(doc: &Document, table: &Table, row: u32, col: u32) -> Vec<Edit> {
 /// `src` with `edits` applied (spans as [`set_cell`] gives them: 1-based
 /// lines and character columns, end exclusive, all on the original text).
 pub fn apply(src: &str, edits: &[Edit]) -> String {
-    // Each edit's span as character offsets into `src`.
-    let mut line_starts = vec![0];
-    let chars: Vec<char> = src.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
-        if c == '\n' {
-            line_starts.push(i + 1);
-        }
-    }
-    let offset = |line: usize, col: usize| {
-        line_starts
-            .get(line - 1)
-            .map_or(chars.len(), |s| (s + col - 1).min(chars.len()))
-    };
-    let mut ranges: Vec<(usize, usize, &str)> = edits
-        .iter()
-        .map(|e| {
-            (
-                offset(e.span.start_line, e.span.start_col),
-                offset(e.span.end_line, e.span.end_col),
-                e.text.as_str(),
-            )
-        })
-        .collect();
-    ranges.sort_by_key(|r| (r.0, r.1));
-    let mut out = String::new();
-    let mut pos = 0;
-    for (start, end, text) in ranges {
-        out.extend(&chars[pos..start]);
-        out += text;
-        pos = end;
-    }
-    out.extend(&chars[pos..]);
-    out
+    parser_rs::apply_edits(src, edits)
 }
 
 #[cfg(test)]
